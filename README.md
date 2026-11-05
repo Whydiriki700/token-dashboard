@@ -4,6 +4,8 @@
 
 A Hermes Desktop plugin that turns the live usage stream into a cost dashboard: a right-hand pane with the focused session's token counts, estimated cost, model, API calls, and context usage, a status bar chip that keeps the running session cost always visible, and an overview of your recent sessions.
 
+> **Status:** Submitted to the official Hermes plugin catalog ([NousResearch/hermes-agent#149187](https://github.com/NousResearch/hermes-agent/pull/149187), under review). Built for the Hermes Agent Plugin Hackathon; the demo was recorded from a real Hermes session.
+
 ## Features
 
 * Live input and output token counts for the focused session, streamed from the backend (no polling of usage data)
@@ -43,3 +45,13 @@ The plugin reads the focused session's usage state and the session list through 
 ## License
 
 MIT
+
+---
+
+**More by the same author**
+
+- [ProofGate](https://github.com/Whydiriki700/proofgate): no proof, no done. Agent completion claims checked against tool evidence, fail closed.
+- [money-magnet](https://github.com/Whydiriki700/money-magnet): finance tracker, budget alerts, crypto portfolio PnL and arbitrage scanner for Hermes Agent.
+- [Token Dashboard](https://github.com/Whydiriki700/token-dashboard): live token usage and cost dashboard for Hermes Desktop.
+- [Osvyn Hub](https://github.com/Whydiriki700/Osvyn-Hub-Muse): multi-account manager for Muse on Windows.
+- Osvyn on Telegram: [t.me/osvynofficial](https://t.me/osvynofficial)

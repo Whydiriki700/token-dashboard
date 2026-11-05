@@ -1,7 +1,16 @@
 /**
  * Hermes Desktop Plugin: Token Cost & Usage Dashboard
- * Real-time token usage, cost tracking, and session analytics.
+ * Live token usage and cost for the focused session, plus a session overview.
  * Hackathon entry - usefulness, reliability, creativity.
+ *
+ * Data sources (verified against the Hermes Desktop SDK and gateway):
+ * - host.state.focusedUsage: live UsageStats for the focused session
+ *   ({ model, input, output, reasoning, total, calls, context_percent,
+ *      cost_usd? }). Streamed by the backend, no RPC needed.
+ * - host.request('session.list', { limit, include_hidden }): session rows
+ *   ({ id, title, preview, started_at, message_count, source }). Rows carry
+ *   NO token or model fields, so this pane never invents per-session token
+ *   totals; token figures describe the focused session only.
  */
 
 import { cn, host, Tip, usePluginI18n, useValue } from '@hermes/plugin-sdk'
@@ -40,112 +49,140 @@ function calcCost(model, inputTok, outputTok) {
   return (inputTok * p.input + outputTok * p.output) / 1e6
 }
 
-function fmt(n) { return n.toLocaleString() }
-function fmtCost(n) { return '$' + n.toFixed(4) }
+function fmt(n) { return (n || 0).toLocaleString() }
+function fmtCost(n) { return '$' + (n || 0).toFixed(4) }
+
+function fmtTime(epochSec) {
+  if (!epochSec) return ''
+  const d = new Date(epochSec * 1000)
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+    d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+// Normalize a UsageStats snapshot across the shapes the backend emits.
+function readUsage(u) {
+  if (!u) return null
+  const input = u.input ?? u.input_tokens ?? u.prompt_tokens ?? 0
+  const output = u.output ?? u.output_tokens ?? u.completion_tokens ?? 0
+  const total = u.total ?? u.total_tokens ?? input + output
+  return {
+    model: u.model || '',
+    input,
+    output,
+    reasoning: u.reasoning ?? u.reasoning_tokens ?? 0,
+    total,
+    calls: u.calls ?? u.api_calls ?? 0,
+    contextPercent: u.context_percent ?? null,
+    costUsd: typeof u.cost_usd === 'number' ? u.cost_usd : null
+  }
+}
+
+function usageCost(u, fallbackModel) {
+  if (!u) return 0
+  if (u.costUsd !== null) return u.costUsd
+  return calcCost(u.model || fallbackModel, u.input, u.output)
+}
 
 function DashboardPane() {
   const t = usePluginI18n(ID)
-  const focusedSession = useValue(host.state.focusedSessionId)
+  const usage = readUsage(useValue(host.state.focusedUsage))
+  const currentModel = useValue(host.state.model)
   const [sessions, setSessions] = useState([])
-  const [totalTokens, setTotalTokens] = useState({ input: 0, output: 0 })
-  const [totalCost, setTotalCost] = useState(0)
-  const [modelBreakdown, setModelBreakdown] = useState({})
-  const [loading, setLoading] = useState(true)
+  const [listError, setListError] = useState('')
 
   useEffect(() => {
-    async function fetchData() {
+    let alive = true
+    let inFlight = false
+    let failing = false
+    async function fetchSessions() {
+      // session.list can cold-spawn a profile backend and take a while;
+      // never stack overlapping requests on a slow gateway.
+      if (inFlight) return
+      inFlight = true
       try {
-        const result = await host.request('sessions.list', { limit: 50 })
-        const sess = result?.sessions || result || []
-        setSessions(sess)
-        
-        let inp = 0, out = 0, cost = 0
-        const breakdown = {}
-        sess.forEach(s => {
-          const m = s.model || 'unknown'
-          const i = s.input_tokens || s.tokens?.input || 0
-          const o = s.output_tokens || s.tokens?.output || 0
-          inp += i; out += o
-          const c = calcCost(m, i, o)
-          cost += c
-          if (!breakdown[m]) breakdown[m] = { input: 0, output: 0, cost: 0, count: 0 }
-          breakdown[m].input += i
-          breakdown[m].output += o
-          breakdown[m].cost += c
-          breakdown[m].count += 1
-        })
-        setTotalTokens({ input: inp, output: out })
-        setTotalCost(cost)
-        setModelBreakdown(breakdown)
+        const result = await host.request('session.list', { limit: 25 })
+        if (!alive) return
+        setSessions(result?.sessions || [])
+        setListError('')
+        failing = false
       } catch (e) {
-        console.error('Token dashboard fetch error:', e)
+        if (!alive) return
+        if (!failing) console.error('Token dashboard session.list error:', e)
+        failing = true
+        setListError('Session list unavailable (gateway slow or restarting)')
+      } finally {
+        inFlight = false
       }
-      setLoading(false)
     }
-    fetchData()
-    const interval = setInterval(fetchData, 10000)
-    return () => clearInterval(interval)
+    fetchSessions()
+    const interval = setInterval(fetchSessions, 10000)
+    return () => { alive = false; clearInterval(interval) }
   }, [])
 
-  if (loading) {
-    return jsx('div', { className: 'flex h-full items-center justify-center text-(--ui-text-tertiary)', children: 'Loading...' })
-  }
+  const model = usage?.model || currentModel || 'unknown'
+  const cost = usageCost(usage, currentModel)
+  const ctxPct = usage?.contextPercent
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-3 p-3 text-sm overflow-auto',
     children: [
-      // Header
       jsx('div', { className: 'font-semibold text-base', children: 'Token & Cost Dashboard' }),
-      
-      // Summary cards
+
+      // Focused session summary cards
       jsxs('div', {
         className: 'grid grid-cols-3 gap-2',
         children: [
           jsxs('div', { className: 'rounded-lg border border-(--ui-stroke-secondary) p-2', children: [
-            jsx('div', { className: 'text-(--ui-text-tertiary) text-xs', children: 'Total Input' }),
-            jsx('div', { className: 'font-mono font-bold', children: fmt(totalTokens.input) })
+            jsx('div', { className: 'text-(--ui-text-tertiary) text-xs', children: 'Input Tokens' }),
+            jsx('div', { className: 'font-mono font-bold', children: fmt(usage?.input) })
           ]}),
           jsxs('div', { className: 'rounded-lg border border-(--ui-stroke-secondary) p-2', children: [
-            jsx('div', { className: 'text-(--ui-text-tertiary) text-xs', children: 'Total Output' }),
-            jsx('div', { className: 'font-mono font-bold', children: fmt(totalTokens.output) })
+            jsx('div', { className: 'text-(--ui-text-tertiary) text-xs', children: 'Output Tokens' }),
+            jsx('div', { className: 'font-mono font-bold', children: fmt(usage?.output) })
           ]}),
           jsxs('div', { className: 'rounded-lg border border-(--ui-stroke-secondary) p-2', children: [
-            jsx('div', { className: 'text-(--ui-text-tertiary) text-xs', children: 'Total Cost' }),
-            jsx('div', { className: 'font-mono font-bold text-(--ui-accent)', children: fmtCost(totalCost) })
+            jsx('div', { className: 'text-(--ui-text-tertiary) text-xs', children: usage?.costUsd !== null && usage ? 'Session Cost' : 'Est. Cost' }),
+            jsx('div', { className: 'font-mono font-bold text-(--ui-accent)', children: fmtCost(cost) })
           ]})
         ]
       }),
 
-      // Model breakdown
-      jsx('div', { className: 'font-medium mt-2', children: 'By Model' }),
-      jsxs('div', {
-        className: 'flex flex-col gap-1',
-        children: Object.entries(modelBreakdown).map(([model, data]) =>
-          jsxs('div', {
-            key: model,
-            className: 'flex items-center justify-between rounded border border-(--ui-stroke-secondary) px-2 py-1 text-xs',
-            children: [
-              jsx('span', { className: 'font-mono truncate max-w-[120px]', children: model }),
-              jsx('span', { children: `${data.count} sess` }),
-              jsx('span', { children: fmt(data.input + data.output) + ' tok' }),
-              jsx('span', { className: 'text-(--ui-accent)', children: fmtCost(data.cost) })
-            ]
+      // Focused session detail
+      jsxs('div', { className: 'flex flex-col gap-1 text-xs', children: [
+        jsxs('div', { className: 'flex items-center justify-between', children: [
+          jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Focused session model' }),
+          jsx('span', { className: 'font-mono truncate max-w-[160px]', children: model })
+        ]}),
+        jsxs('div', { className: 'flex items-center justify-between', children: [
+          jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'API calls' }),
+          jsx('span', { children: fmt(usage?.calls) })
+        ]}),
+        ctxPct !== null && ctxPct !== undefined ? jsxs('div', { children: [
+          jsxs('div', { className: 'flex items-center justify-between', children: [
+            jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Context used' }),
+            jsx('span', { children: Math.round(ctxPct) + '%' })
+          ]}),
+          jsx('div', { className: 'h-1.5 rounded bg-(--ui-stroke-secondary) overflow-hidden', children:
+            jsx('div', { className: 'h-full bg-(--ui-accent)', style: { width: Math.max(0, Math.min(100, ctxPct)) + '%' } })
           })
-        )
-      }),
+        ]}) : null
+      ]}),
 
-      // Recent sessions
-      jsx('div', { className: 'font-medium mt-2', children: 'Recent Sessions' }),
+      jsx('div', { className: 'text-(--ui-text-tertiary) text-xs', children: 'Token figures track the focused session live. Hermes does not expose per-session token history, so past sessions are listed with their message counts.' }),
+
+      // Sessions overview
+      jsxs('div', { className: 'font-medium mt-1', children: ['Sessions', jsx('span', { className: 'text-(--ui-text-tertiary) font-normal', children: ' (' + sessions.length + ')' })] }),
+      listError ? jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: listError }) : null,
       jsxs('div', {
-        className: 'flex flex-col gap-1 max-h-48 overflow-auto',
+        className: 'flex flex-col gap-1 max-h-56 overflow-auto',
         children: sessions.slice(0, 10).map((s, i) =>
           jsxs('div', {
-            key: i,
+            key: s.id || i,
             className: 'flex items-center justify-between text-xs rounded px-2 py-1 hover:bg-(--chrome-action-hover)',
             children: [
-              jsx('span', { className: 'truncate max-w-[100px]', children: s.title || s.id || 'Session' }),
-              jsx('span', { className: 'text-(--ui-text-tertiary)', children: s.model || '-' }),
-              jsx('span', { children: fmt((s.input_tokens||0)+(s.output_tokens||0)) })
+              jsx('span', { className: 'truncate max-w-[130px]', children: s.title || s.preview || 'Session' }),
+              jsx('span', { className: 'text-(--ui-text-tertiary)', children: fmtTime(s.started_at) }),
+              jsx('span', { children: fmt(s.message_count) + ' msgs' })
             ]
           })
         )
@@ -155,11 +192,11 @@ function DashboardPane() {
 }
 
 function StatusChip() {
-  const focusedUsage = useValue(host.state.focusedUsage)
-  const inp = focusedUsage?.input_tokens || 0
-  const out = focusedUsage?.output_tokens || 0
-  const model = focusedUsage?.model || ''
-  const cost = calcCost(model, inp, out)
+  const usage = readUsage(useValue(host.state.focusedUsage))
+  const currentModel = useValue(host.state.model)
+  const inp = usage?.input || 0
+  const out = usage?.output || 0
+  const cost = usageCost(usage, currentModel)
 
   return jsx(Tip, {
     label: `Input: ${fmt(inp)} | Output: ${fmt(out)} | Cost: ${fmtCost(cost)}`,
@@ -169,7 +206,7 @@ function StatusChip() {
         'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
       ),
       type: 'button',
-      onClick: () => host.notify({ kind: 'info', message: `Session: ${fmt(inp+out)} tokens, ${fmtCost(cost)}` }),
+      onClick: () => host.notify({ kind: 'info', message: `Session: ${fmt(inp + out)} tokens, ${fmtCost(cost)}` }),
       children: [
         jsx('span', { children: '📊' }),
         jsx('span', { children: fmt(inp + out) })

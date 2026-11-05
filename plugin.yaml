@@ -1,0 +1,5 @@
+name: token-dashboard
+version: 1.0.0
+description: "Token Cost & Usage Dashboard for Hermes Desktop: real-time token usage, per-model cost calculation, session history, and a status bar chip."
+author: "Ried"
+requires_hermes: ">=0.22.0"

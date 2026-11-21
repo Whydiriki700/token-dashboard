@@ -1,3 +1,5 @@
+![token-dashboard](assets/preview.png)
+
 # Token Dashboard
 
 **See what your focused session actually costs, while it works.**

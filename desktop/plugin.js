@@ -41,6 +41,19 @@
  *   turn ends. It flips before the prompt's row is stored (the submit round
  *   trip can take seconds under load), so a new task's start waits for its
  *   own row instead of adopting the newest one on sight.
+ * - host.request('session.context_breakdown', { session_id }): the gateway's
+ *   estimate of the focused session's context, read while the live usage
+ *   carries no context_percent and the pane is not busy — when the pane
+ *   opens on a session, when the focused session changes and when a turn
+ *   ends. With a resident agent
+ *   it carries that agent's window (context_max) and share (context_percent,
+ *   with context_estimated true while the share is estimated rather than
+ *   measured); with no resident agent — a session not run since the gateway
+ *   started, or an idle one's agent reaped — context_max is 0 and
+ *   estimated_total is the count the session's frozen system prompt, tools
+ *   and stored transcript add up to, its window unknown. A session outside
+ *   the gateway's live table is refused (not_found). Read-only: no provider
+ *   call and no prompt-cache impact.
  * - ctx.storage: the compression threshold the user entered for this plugin
  *   (compression.threshold of config.yaml, the same figure: 0.7, or 70 for
  *   70%) and, when one is given, the reserved output (a runtime `max_tokens`
@@ -942,6 +955,35 @@ function rowIsSession(row, id) {
   return !!id && !!row && (row.id === id || row.resolved_id === id || row._lineage_root_id === id)
 }
 
+// The reading the context row shows for the focused session, or null when
+// there is none and the row is not drawn. The live figure wins whenever the
+// backend streams one (a null is no figure; 0% is one). Otherwise the
+// gateway's estimate: with a window it gives the share and the window, the
+// share marked approximate (the pane draws it with a '~') while
+// context_estimated says it was not measured; with no window — no resident
+// agent in this gateway process — only estimated_total, the count the
+// session's frozen system prompt, tools and stored transcript add up to, so
+// the row can say that much and no share. Pure: the same inputs give the
+// same reading.
+function contextReading(live, estimate) {
+  const pct = live?.contextPercent
+  if (pct !== null && pct !== undefined) {
+    return { pct, max: live.contextMax ?? null, approximate: false, estimatedTotal: null }
+  }
+  if (estimate && Number(estimate.context_max) > 0) {
+    return {
+      pct: Number(estimate.context_percent) || 0,
+      max: Number(estimate.context_max),
+      approximate: !!estimate.context_estimated,
+      estimatedTotal: null
+    }
+  }
+  if (estimate && Number(estimate.estimated_total) > 0) {
+    return { pct: null, max: null, approximate: false, estimatedTotal: Number(estimate.estimated_total) }
+  }
+  return null
+}
+
 function DashboardPane({ storage }) {
   const t = usePluginI18n(ID)
   const usage = readUsage(useValue(host.state.focusedUsage))
@@ -957,8 +999,13 @@ function DashboardPane({ storage }) {
   // the moment before the next one's own first read lands.
   const [taskOf, setTaskOf] = useState(null)
   const [infoOf, setInfoOf] = useState(null)
+  // The gateway's context estimate, kept against the session it was read for
+  // like the two above; a failed read leaves that session's last reading in
+  // place rather than clearing it.
+  const [contextOf, setContextOf] = useState(null)
   const taskTurn = taskOf && taskOf.sessionId === focusedRuntimeId ? taskOf.turn : null
   const sessionInfo = infoOf && infoOf.sessionId === focusedRuntimeId ? infoOf.info : null
+  const contextEstimate = contextOf && contextOf.sessionId === focusedRuntimeId ? contextOf.estimate : null
   const [stored, setStored] = useState(() => readStoredCompression(storage))
   // Storage is a local key-value store; a build without it can neither read
   // nor keep a threshold, so the entry point stays hidden there.
@@ -1195,6 +1242,51 @@ function DashboardPane({ storage }) {
     return () => { alive = false; clearInterval(id) }
   }, [focusedRuntimeId])
 
+  // The context row's fallback for the times the live usage carries no
+  // context_percent: after a restart, or once the gateway has reaped an idle
+  // session's agent, the row would otherwise be gone until the session speaks
+  // again. Read when the pane opens on a session, and on the two moments a
+  // reading can change with no turn streaming over it — the focused session
+  // changing, and a turn ending — and
+  // not while busy, when the live usage is what the turn reports and an
+  // estimate read mid-turn would date the transcript at its own moment; nor
+  // while a live figure is in hand, which is the one shown.
+  const liveCtxPct = usage?.contextPercent
+  const liveCtxRef = useRef(liveCtxPct)
+  liveCtxRef.current = liveCtxPct
+  const ctxFailRef = useRef({ sessionId: null, failing: false })
+  useEffect(() => {
+    if (!focusedRuntimeId || busy) return
+    const live = liveCtxRef.current
+    if (live !== null && live !== undefined) return
+    // One log line per run of failures of this session, as the session list
+    // read logs its own; another session that reads starts a fresh run.
+    const fail = ctxFailRef.current
+    if (fail.sessionId !== focusedRuntimeId) {
+      fail.sessionId = focusedRuntimeId
+      fail.failing = false
+    }
+    let alive = true
+    async function readEstimate() {
+      try {
+        const result = await ask('session.context_breakdown', { session_id: focusedRuntimeId })
+        // The session switched, or a turn began, while the read was out: the
+        // answer describes a moment the pane is no longer showing.
+        if (!alive || busyRef.current) return
+        if (result && typeof result === 'object') {
+          setContextOf({ sessionId: focusedRuntimeId, estimate: result })
+        }
+        fail.failing = false
+      } catch (e) {
+        if (!alive) return
+        if (!fail.failing) console.error('Token dashboard session.context_breakdown error:', e)
+        fail.failing = true
+      }
+    }
+    readEstimate()
+    return () => { alive = false }
+  }, [focusedRuntimeId, busy])
+
   // The form opens and closes with its message: a write the storage did
   // not keep is said in it, and gone once the form is used again.
   function setForm(open) {
@@ -1277,12 +1369,19 @@ function DashboardPane({ storage }) {
        '')
     : ''
   const cost = usageCost(usage, currentModel)
-  const ctxPct = usage?.contextPercent
+  // The context row's reading: the live figure while the backend streams one,
+  // else the gateway's estimate for a session it has not measured in this
+  // process — the estimate hidden while busy, when the turn streams the live
+  // usage and a reading taken mid-turn would date the transcript at its own
+  // moment; the live figure stays.
+  const ctxReading = contextReading(usage, busy ? null : contextEstimate)
   // The mark on the context bar: an estimate of where the gateway's
   // threshold arithmetic puts the trigger on this session's window, from the
-  // two stored figures (see COMPRESSION for what it cannot know). Nothing
-  // to place while no threshold is stored or the window is unknown.
-  const trigger = compressionTrigger(stored, usage?.contextMax,
+  // two stored figures (see COMPRESSION for what it cannot know). Placed on
+  // the window the reading carries — the live figure's own, or the estimate's
+  // when it knows one. Nothing to place while no threshold is stored or the
+  // window is unknown.
+  const trigger = compressionTrigger(stored, ctxReading ? ctxReading.max : null,
     usage?.model || currentModel || '', sessionInfo?.provider || '')
   const thresholdTitle = trigger
     ? 'Estimated compression threshold ' + trigger.configured +
@@ -1291,6 +1390,12 @@ function DashboardPane({ storage }) {
       (trigger.floored ? '; the stored percentage is raised to 75% for windows under 512K' : '') + '). ' +
       "Figured from what was entered here: per-model overrides, the threshold_tokens cap, the summariser model's window and any output the route reserves by itself " +
       "move the real trigger too, and nothing compresses while compression is off — none of that is visible to this pane."
+    : undefined
+  // A windowless estimate has no share to mark: its hover text says what the
+  // count is and why there is no window, in place of the mark's.
+  const estimateTitle = ctxReading?.estimatedTotal != null
+    ? "Estimated from the session's stored transcript: about " + fmt(ctxReading.estimatedTotal) +
+      ' tokens. The context window is unknown, because the session has not run in the current gateway process yet.'
     : undefined
 
   // Elapsed time of the focused session: match it against the session list
@@ -1379,24 +1484,36 @@ function DashboardPane({ storage }) {
           jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'API calls' }),
           jsx('span', { children: fmt(usage?.calls) })
         ]}),
-        ctxPct !== null && ctxPct !== undefined ? jsxs('div', { children: [
-          jsxs('div', { className: 'flex items-center justify-between', title: thresholdTitle, children: [
-            jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Context used' }),
-            jsxs('span', { style: { display: 'flex', alignItems: 'center' }, children: [
-              jsx('span', { children: Math.round(ctxPct) + '%' }),
-              // The threshold's entry point, kept beside the bar it draws on.
-              canStore ? jsx('button', {
-                type: 'button',
-                title: 'Compression threshold: the setting that places the mark on this bar',
-                onClick: () => setForm(!editing),
-                style: ACTION,
-                children: editing ? 'close' : trigger ? 'edit' : 'set'
-              }) : null
-            ]})
-          ]}),
-          jsxs('div', { style: { position: 'relative' }, children: [
+        ctxReading ? jsxs('div', { children: [
+          jsxs('div', {
+            className: 'flex items-center justify-between',
+            title: ctxReading.estimatedTotal != null ? estimateTitle : thresholdTitle,
+            children: [
+              jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Context used' }),
+              jsxs('span', { style: { display: 'flex', alignItems: 'center' }, children: [
+                jsx('span', {
+                  children: ctxReading.estimatedTotal != null
+                    ? '≈ ' + fmt(ctxReading.estimatedTotal) + ' tokens'
+                    : (ctxReading.approximate ? '~' : '') + Math.round(ctxReading.pct) + '%'
+                }),
+                // The threshold's entry point, kept beside the bar it draws on.
+                // It reads `edit` once a threshold is stored, whether the reading
+                // knows a window to place the mark on or not: the form shows what
+                // is stored either way.
+                canStore ? jsx('button', {
+                  type: 'button',
+                  title: 'Compression threshold: the setting that places the mark on this bar',
+                  onClick: () => setForm(!editing),
+                  style: ACTION,
+                  children: editing ? 'close' : stored ? 'edit' : 'set'
+                }) : null
+              ]})
+            ]
+          }),
+          // A windowless estimate has no share to draw: neither a fill nor a mark.
+          ctxReading.pct !== null && ctxReading.pct !== undefined ? jsxs('div', { style: { position: 'relative' }, children: [
             jsx('div', { className: 'h-1.5 rounded bg-(--ui-stroke-secondary) overflow-hidden', children:
-              jsx('div', { className: 'h-full bg-(--ui-accent)', style: { width: Math.max(0, Math.min(100, ctxPct)) + '%' } })
+              jsx('div', { className: 'h-full bg-(--ui-accent)', style: { width: Math.max(0, Math.min(100, ctxReading.pct)) + '%' } })
             }),
             // The compression threshold: a wide tick across the bar, standing
             // a little above and below it, the estimate in its hover text.
@@ -1408,7 +1525,7 @@ function DashboardPane({ storage }) {
               },
               children: jsx('div', { style: { width: 6, borderRadius: 2, background: 'var(--ui-text-secondary)' } })
             }) : null
-          ]}),
+          ]}) : null,
           // The threshold form: the two figures config.yaml holds, typed by hand.
           editing ? jsxs('form', {
             onSubmit: saveThreshold,
